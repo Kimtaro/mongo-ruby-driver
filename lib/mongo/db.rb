@@ -395,6 +395,13 @@ module Mongo
 
       oh = BSON::OrderedHash.new
       oh[:$eval] = code
+      
+      args.each do |a|
+        if a.is_a?(Hash) && a.has_key?(:nolock)
+          oh[:nolock] = a.delete(:nolock)
+        end
+      end
+      
       oh[:args]  = args
       doc = command(oh)
       doc['retval']
