@@ -16,14 +16,13 @@
 # limitations under the License.
 # ++
 
-$:.unshift(File.join(File.dirname(__FILE__), '..', 'lib'))
-
 require 'mongo/version'
 
 module Mongo
-  ASCENDING  =  1
-  DESCENDING = -1
-  GEO2D      = '2d'
+  ASCENDING   =  1
+  DESCENDING  = -1
+  GEO2D       = '2d'
+  GEOHAYSTACK = 'geoHaystack'
 
   DEFAULT_MAX_BSON_SIZE = 4 * 1024 * 1024
 
@@ -56,11 +55,16 @@ require 'bson'
 require 'mongo/util/conversions'
 require 'mongo/util/support'
 require 'mongo/util/core_ext'
+require 'mongo/util/logging'
+require 'mongo/util/node'
 require 'mongo/util/pool'
+require 'mongo/util/pool_manager'
 require 'mongo/util/server_version'
+require 'mongo/util/ssl_socket'
 require 'mongo/util/uri_parser'
 
 require 'mongo/collection'
+require 'mongo/networking'
 require 'mongo/connection'
 require 'mongo/repl_set_connection'
 require 'mongo/cursor'

@@ -19,6 +19,7 @@ module Mongo
 
   # A named collection of documents in a database.
   class Collection
+    include Mongo::Logging
 
     attr_reader :db, :name, :pk_factory, :hint, :safe
 
@@ -34,6 +35,11 @@ module Mongo
     #   for insert, update, and remove method called on this Collection instance. If no
     #   value is provided, the default value set on this instance's DB will be used. This
     #   default can be overridden for any invocation of insert, update, or remove.
+    # @option options [:primary, :secondary] :read The default read preference for queries
+    #   initiates from this connection object. If +:secondary+ is chosen, reads will be sent
+    #   to one of the closest available secondary nodes. If a secondary node cannot be located, the
+    #   read will be sent to the primary. If this option is left unspecified, the value of the read
+    #   preference for this collection's associated Mongo::DB object will be used.
     #
     # @raise [InvalidNSName]
     #   if collection name is empty, contains '$', or starts or ends with '.'
@@ -47,7 +53,8 @@ module Mongo
     def initialize(name, db, opts={})
       if db.is_a?(String) && name.is_a?(Mongo::DB)
         warn "Warning: the order of parameters to initialize a collection have changed. " +
-             "Please specify the collection name first, followed by the db."
+             "Please specify the collection name first, followed by the db. This will be made permanent" +
+             "in v2.0."
         db, name = name, db
       end
 
@@ -79,13 +86,30 @@ module Mongo
 
       @db, @name  = db, name
       @connection = @db.connection
+      @logger     = @connection.logger
       @cache_time = @db.cache_time
       @cache = Hash.new(0)
       unless pk_factory
         @safe = opts.fetch(:safe, @db.safe)
+        if value = opts[:read]
+          Mongo::Support.validate_read_preference(value)
+        else
+          value = @db.read_preference
+        end
+        @read_preference = value.is_a?(Hash) ? value.dup : value
       end
       @pk_factory = pk_factory || opts[:pk] || BSON::ObjectId
       @hint = nil
+    end
+
+    # Indicate whether this is a capped collection.
+    #
+    # @raise [Mongo::OperationFailure]
+    #   if the collection doesn't exist.
+    #
+    # @return [Boolean]
+    def capped?
+      @db.command({:collstats => @name})['capped'] == 1
     end
 
     # Return a sub-collection of this collection by name. If 'users' is a collection, then
@@ -144,6 +168,11 @@ module Mongo
     #   you can cut down on network traffic and decoding time. If using a Hash, keys should be field
     #   names and values should be either 1 or 0, depending on whether you want to include or exclude
     #   the given field.
+    # @option opts [:primary, :secondary] :read The default read preference for queries
+    #   initiates from this connection object. If +:secondary+ is chosen, reads will be sent
+    #   to one of the closest available secondary nodes. If a secondary node cannot be located, the
+    #   read will be sent to the primary. If this option is left unspecified, the value of the read
+    #   preference for this Collection object will be used.
     # @option opts [Integer] :skip number of documents to skip from the beginning of the result set
     # @option opts [Integer] :limit maximum number of documents to return
     # @option opts [Array]   :sort an array of [key, direction] pairs to sort by. Direction should
@@ -189,7 +218,8 @@ module Mongo
       max_scan   = opts.delete(:max_scan)
       return_key = opts.delete(:return_key)
       transformer = opts.delete(:transformer)
-      show_disk_loc = opts.delete(:max_scan)
+      show_disk_loc = opts.delete(:show_disk_loc)
+      read          = opts.delete(:read) || @read_preference
 
       if timeout == false && !block_given?
         raise ArgumentError, "Collection#find must be invoked with a block when timeout is disabled."
@@ -204,19 +234,20 @@ module Mongo
       raise RuntimeError, "Unknown options [#{opts.inspect}]" unless opts.empty?
 
       cursor = Cursor.new(self, {
-        :selector    => selector, 
-        :fields      => fields, 
-        :skip        => skip, 
+        :selector    => selector,
+        :fields      => fields,
+        :skip        => skip,
         :limit       => limit,
-        :order       => sort, 
-        :hint        => hint, 
-        :snapshot    => snapshot, 
-        :timeout     => timeout, 
+        :order       => sort,
+        :hint        => hint,
+        :snapshot    => snapshot,
+        :timeout     => timeout,
         :batch_size  => batch_size,
         :transformer => transformer,
         :max_scan    => max_scan,
         :show_disk_loc => show_disk_loc,
-        :return_key    => return_key
+        :return_key    => return_key,
+        :read          => read
       })
 
       if block_given?
@@ -273,8 +304,6 @@ module Mongo
     #   for DB#error.
     #
     # @raise [OperationFailure] when :safe mode fails.
-    #
-    # @see DB#remove for options that can be passed to :safe.
     def save(doc, opts={})
       if doc.has_key?(:_id) || doc.has_key?('_id')
         id = doc[:_id] || doc['_id']
@@ -292,6 +321,10 @@ module Mongo
     #
     # @return [ObjectId, Array]
     #   The _id of the inserted document or a list of _ids of all inserted documents.
+    # @return [[ObjectId, Array], [Hash, Array]]
+    #   1st, the _id of the inserted document or a list of _ids of all inserted documents.
+    #   2nd, a list of invalid documents.
+    #   Return this result format only when :collect_on_error is true.
     #
     # @option opts [Boolean, Hash] :safe (+false+)
     #   run the operation in safe mode, which run a getlasterror command on the
@@ -301,14 +334,23 @@ module Mongo
     #   its database object, or the current connection. See the options on
     #   for DB#get_last_error.
     #
-    # @see DB#remove for options that can be passed to :safe.
+    # @option opts [Boolean] :continue_on_error (+false+) If true, then
+    #   continue a bulk insert even if one of the documents inserted
+    #   triggers a database assertion (as in a duplicate insert, for instance).
+    #   If not using safe mode, the list of ids returned will
+    #   include the object ids of all documents attempted on insert, even
+    #   if some are rejected on error. When safe mode is
+    #   enabled, any error will raise an OperationFailure exception.
+    #   MongoDB v2.0+.
+    # @option opts [Boolean] :collect_on_error (+false+) if true, then
+    #   collects invalid documents as an array. Note that this option changes the result format.
     #
     # @core insert insert-instance_method
     def insert(doc_or_docs, opts={})
       doc_or_docs = [doc_or_docs] unless doc_or_docs.is_a?(Array)
       doc_or_docs.collect! { |doc| @pk_factory.create_pk(doc) }
       safe = opts.fetch(:safe, @safe)
-      result = insert_documents(doc_or_docs, @name, true, safe)
+      result = insert_documents(doc_or_docs, @name, true, safe, opts)
       result.size > 1 ? result : result.first
     end
     alias_method :<<, :insert
@@ -338,8 +380,6 @@ module Mongo
     # @raise [Mongo::OperationFailure] an exception will be raised iff safe mode is enabled
     #   and the operation fails.
     #
-    # @see DB#remove for options that can be passed to :safe.
-    #
     # @core remove remove-instance_method
     def remove(selector={}, opts={})
       # Initial byte is 0.
@@ -347,9 +387,9 @@ module Mongo
       message = BSON::ByteBuffer.new("\0\0\0\0")
       BSON::BSON_RUBY.serialize_cstr(message, "#{@db.name}.#{@name}")
       message.put_int(0)
-      message.put_binary(BSON::BSON_CODER.serialize(selector, false, true).to_s)
+      message.put_binary(BSON::BSON_CODER.serialize(selector, false, true, @connection.max_bson_size).to_s)
 
-      @connection.instrument(:remove, :database => @db.name, :collection => @name, :selector => selector) do
+      instrument(:remove, :database => @db.name, :collection => @name, :selector => selector) do
         if safe
           @connection.send_message_with_safe_check(Mongo::Constants::OP_DELETE, message, @db.name, nil, safe)
         else
@@ -394,9 +434,9 @@ module Mongo
       update_options += 2 if opts[:multi]
       message.put_int(update_options)
       message.put_binary(BSON::BSON_CODER.serialize(selector, false, true).to_s)
-      message.put_binary(BSON::BSON_CODER.serialize(document, false, true).to_s)
+      message.put_binary(BSON::BSON_CODER.serialize(document, false, true, @connection.max_bson_size).to_s)
 
-      @connection.instrument(:update, :database => @db.name, :collection => @name, :selector => selector, :document => document) do
+      instrument(:update, :database => @db.name, :collection => @name, :selector => selector, :document => document) do
         if safe
           @connection.send_message_with_safe_check(Mongo::Constants::OP_UPDATE, message, @db.name, nil, safe)
         else
@@ -562,12 +602,12 @@ module Mongo
     # @option opts [Boolean ] :verbose (false) if true, provides statistics on job execution time.
     # @option opts [Boolean] :raw (false) if true, return the raw result object from the map_reduce command, and not
     #   the instantiated collection that's returned by default. Note if a collection name isn't returned in the
-    #   map-reduce output (as, for example, when using :out => {:inline => 1}), then you must specify this option
+    #   map-reduce output (as, for example, when using :out => { :inline => 1 }), then you must specify this option
     #   or an ArgumentError will be raised.
     #
     # @return [Collection, Hash] a Mongo::Collection object or a Hash with the map-reduce command's results.
     #
-    # @raise ArgumentError if you specify {:out => {:inline => true}} but don't specify :raw => true.
+    # @raise ArgumentError if you specify { :out => { :inline => true }} but don't specify :raw => true.
     #
     # @see http://www.mongodb.org/display/DOCS/MapReduce Offical MongoDB map/reduce documentation.
     #
@@ -582,6 +622,9 @@ module Mongo
       hash['map'] = map
       hash['reduce'] = reduce
       hash.merge! opts
+      if hash[:sort]
+        hash[:sort] = Mongo::Support.format_order_clause(hash[:sort])
+      end
 
       result = @db.command(hash)
       unless Mongo::Support.ok?(result)
@@ -591,7 +634,12 @@ module Mongo
       if raw
         result
       elsif result["result"]
-        @db[result["result"]]
+        if result['result'].is_a? BSON::OrderedHash and result['result'].has_key? 'db' and result['result'].has_key? 'collection'
+          otherdb = @db.connection[result['result']['db']]
+          otherdb[result['result']['collection']]
+        else
+          @db[result["result"]]
+        end
       else
         raise ArgumentError, "Could not instantiate collection from result. If you specified " +
           "{:out => {:inline => true}}, then you must also specify :raw => true to get the results."
@@ -619,7 +667,7 @@ module Mongo
       if opts.is_a?(Hash)
         return new_group(opts)
       else
-        warn "Collection#group no longer take a list of parameters. This usage is deprecated." +
+        warn "Collection#group no longer take a list of parameters. This usage is deprecated and will be remove in v2.0." +
              "Check out the new API at http://api.mongodb.org/ruby/current/Mongo/Collection.html#group-instance_method"
       end
 
@@ -664,6 +712,13 @@ module Mongo
       else
         raise OperationFailure, "group command failed: #{result['errmsg']}"
       end
+    end
+
+    # The value of the read preference. This will be
+    # either +:primary+, +:secondary+, or an object
+    # representing the tags to be read from.
+    def read_preference
+      @read_preference
     end
 
     private
@@ -802,9 +857,15 @@ module Mongo
 
     # Get the number of documents in this collection.
     #
+    # @option opts [Hash] :query ({}) A query selector for filtering the documents counted.
+    # @option opts [Integer] :skip (nil) The number of documents to skip.
+    # @option opts [Integer] :limit (nil) The number of documents to limit.
+    #
     # @return [Integer]
-    def count
-      find().count()
+    def count(opts={})
+      find(opts[:query],
+           :skip => opts[:skip],
+           :limit => opts[:limit]).count(true)
     end
 
     alias :size :count
@@ -827,7 +888,7 @@ module Mongo
     end
 
     private
-  
+
     def index_name(spec)
       field_spec = parse_index_spec(spec)
       index_information.each do |index|
@@ -842,7 +903,7 @@ module Mongo
         field_spec[spec.to_s] = 1
       elsif spec.is_a?(Array) && spec.all? {|field| field.is_a?(Array) }
         spec.each do |f|
-          if [Mongo::ASCENDING, Mongo::DESCENDING, Mongo::GEO2D].include?(f[1])
+          if [Mongo::ASCENDING, Mongo::DESCENDING, Mongo::GEO2D, Mongo::GEOHAYSTACK].include?(f[1])
             field_spec[f[0].to_s] = f[1]
           else
             raise MongoArgumentError, "Invalid index field #{f[1].inspect}; " + 
@@ -882,23 +943,51 @@ module Mongo
     # Sends a Mongo::Constants::OP_INSERT message to the database.
     # Takes an array of +documents+, an optional +collection_name+, and a
     # +check_keys+ setting.
-    def insert_documents(documents, collection_name=@name, check_keys=true, safe=false)
-      # Initial byte is 0.
-      message = BSON::ByteBuffer.new("\0\0\0\0")
-      BSON::BSON_RUBY.serialize_cstr(message, "#{@db.name}.#{collection_name}")
-      documents.each do |doc|
-        message.put_binary(BSON::BSON_CODER.serialize(doc, check_keys, true).to_s)
+    def insert_documents(documents, collection_name=@name, check_keys=true, safe=false, flags={})
+      if flags[:continue_on_error]
+        message = BSON::ByteBuffer.new
+        message.put_int(1)
+      else
+        message = BSON::ByteBuffer.new("\0\0\0\0")
       end
+
+      collect_on_error = !!flags[:collect_on_error]
+      error_docs = [] if collect_on_error
+
+      BSON::BSON_RUBY.serialize_cstr(message, "#{@db.name}.#{collection_name}")
+      documents =
+        if collect_on_error
+          documents.select do |doc|
+            begin
+              message.put_binary(BSON::BSON_CODER.serialize(doc, check_keys, true, @connection.max_bson_size).to_s)
+              true
+            rescue StandardError => e  # StandardError will be replaced with BSONError
+              doc.delete(:_id)
+              error_docs << doc
+              false
+            end
+          end
+        else
+          documents.each do |doc|
+            message.put_binary(BSON::BSON_CODER.serialize(doc, check_keys, true, @connection.max_bson_size).to_s)
+          end
+        end
       raise InvalidOperation, "Exceded maximum insert size of 16,000,000 bytes" if message.size > 16_000_000
 
-      @connection.instrument(:insert, :database => @db.name, :collection => collection_name, :documents => documents) do
+      instrument(:insert, :database => @db.name, :collection => collection_name, :documents => documents) do
         if safe
           @connection.send_message_with_safe_check(Mongo::Constants::OP_INSERT, message, @db.name, nil, safe)
         else
           @connection.send_message(Mongo::Constants::OP_INSERT, message)
         end
       end
-      documents.collect { |o| o[:_id] || o['_id'] }
+
+      doc_ids = documents.collect { |o| o[:_id] || o['_id'] }
+      if collect_on_error
+        return doc_ids, error_docs
+      else
+        doc_ids
+      end
     end
 
     def generate_index_name(spec)

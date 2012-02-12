@@ -1,14 +1,11 @@
 $:.unshift(File.join(File.dirname(__FILE__), '..', 'lib'))
 require './test/replica_sets/rs_test_helper'
 
-# NOTE: This test expects a replica set of three nodes to be running on local host.
 class ReplicaSetAckTest < Test::Unit::TestCase
-  include Mongo
 
   def setup
-    RS.ensure_up
-
-    @conn = ReplSetConnection.new([RS.host, RS.ports[0]])
+    ensure_rs
+    @conn = ReplSetConnection.new([@rs.host, @rs.ports[0]])
 
     @slave1 = Connection.new(@conn.secondary_pools[0].host,
       @conn.secondary_pools[0].port, :slave_ok => true)
@@ -18,6 +15,11 @@ class ReplicaSetAckTest < Test::Unit::TestCase
     @db = @conn.db(MONGO_TEST_DB)
     @db.drop_collection("test-sets")
     @col = @db.collection("test-sets")
+  end
+
+  def teardown
+    @rs.restart_killed_nodes
+    @conn.close if @conn
   end
 
   def test_safe_mode_with_w_failure
@@ -33,15 +35,15 @@ class ReplicaSetAckTest < Test::Unit::TestCase
   end
 
   def test_safe_mode_replication_ack
-    @col.insert({:baz => "bar"}, :safe => {:w => 2, :wtimeout => 5000})
+    @col.insert({:baz => "bar"}, :safe => {:w => 3, :wtimeout => 5000})
 
-    assert @col.insert({:foo => "0" * 5000}, :safe => {:w => 2, :wtimeout => 5000})
+    assert @col.insert({:foo => "0" * 5000}, :safe => {:w => 3, :wtimeout => 5000})
     assert_equal 2, @slave1[MONGO_TEST_DB]["test-sets"].count
 
-    assert @col.update({:baz => "bar"}, {:baz => "foo"}, :safe => {:w => 2, :wtimeout => 5000})
+    assert @col.update({:baz => "bar"}, {:baz => "foo"}, :safe => {:w => 3, :wtimeout => 5000})
     assert @slave1[MONGO_TEST_DB]["test-sets"].find_one({:baz => "foo"})
 
-    assert @col.remove({}, :safe => {:w => 2, :wtimeout => 5000})
+    assert @col.remove({}, :safe => {:w => 3, :wtimeout => 5000})
     assert_equal 0, @slave1[MONGO_TEST_DB]["test-sets"].count
   end
 

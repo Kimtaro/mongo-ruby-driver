@@ -1,4 +1,5 @@
-require "./lib/bson"
+$:.unshift(File.join(File.dirname(__FILE__), 'lib'))
+require 'bson'
 
 Gem::Specification.new do |s|
   s.name = 'bson'
@@ -14,7 +15,7 @@ Gem::Specification.new do |s|
   s.files  = ['LICENSE.txt']
   s.files += ['lib/bson.rb'] + Dir['lib/bson/**/*.rb']
   s.files += ['bin/b2json', 'bin/j2bson']
-  s.files += ['ext/java/jar/jbson.jar', 'ext/java/jar/mongo-2.4.jar']
+  s.files += ['ext/java/jar/jbson.jar', 'ext/java/jar/mongo-2.6.5.jar']
   s.test_files = Dir['test/bson/*.rb']
 
   s.executables = ['b2json', 'j2bson']

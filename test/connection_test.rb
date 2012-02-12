@@ -13,7 +13,7 @@ class TestConnection < Test::Unit::TestCase
   end
 
   def teardown
-    @conn[MONGO_TEST_DB].get_last_error
+    @conn.close
   end
 
   def test_connection_failure
@@ -22,20 +22,19 @@ class TestConnection < Test::Unit::TestCase
     end
   end
 
-  def test_connection_timeout
-    passed = false
-    begin
-      t0 = Time.now
-      Mongo::Connection.new('192.169.169.1', 27017, :connect_timeout => 3)
-    rescue OperationTimeout
-      passed = true
-      t1 = Time.now
-    end
+ # def test_connection_timeout
+ #   passed = false
+ #   begin
+ #     t0 = Time.now
+ #     Mongo::Connection.new('foo.bar', 27017, :connect_timeout => 3)
+ #   rescue OperationTimeout
+ #     passed = true
+ #     t1 = Time.now
+ #   end
 
-    assert passed
-    assert t1 - t0 < 4
-  end
-
+ #   assert passed
+ #   assert t1 - t0 < 4
+ # end
 
   def test_host_port_accessors
     assert_equal @conn.host, TEST_HOST
@@ -162,8 +161,8 @@ class TestConnection < Test::Unit::TestCase
   end
 
   def test_nodes
-    db = Connection.multi([['foo', 27017], ['bar', 27018]], :connect => false)
-    nodes = db.nodes
+    conn = Connection.multi([['foo', 27017], ['bar', 27018]], :connect => false)
+    nodes = conn.nodes
     assert_equal 2, nodes.length
     assert_equal ['foo', 27017], nodes[0]
     assert_equal ['bar', 27018], nodes[1]
@@ -191,35 +190,32 @@ class TestConnection < Test::Unit::TestCase
   end
 
   def test_max_bson_size_value
+    conn = standard_connection(:connect => false)
+
+    admin_db = Object.new
+    admin_db.expects(:command).returns({'ok' => 1, 'ismaster' => 1, 'maxBsonObjectSize' => 15_000_000})
+    conn.expects(:[]).with('admin').returns(admin_db)
+    conn.connect
+    assert_equal 15_000_000, conn.max_bson_size
+
     conn = standard_connection
     if conn.server_version > "1.7.2"
       assert_equal conn['admin'].command({:ismaster => 1})['maxBsonObjectSize'], conn.max_bson_size
     end
 
     conn.connect
-    assert_equal BSON::BSON_CODER.max_bson_size, conn.max_bson_size
-    doc = {'n' => 'a' * (BSON_CODER.max_bson_size - 11)}
+    doc = {'n' => 'a' * (conn.max_bson_size)}
     assert_raise InvalidDocument do
-      assert BSON::BSON_CODER.serialize(doc)
-    end
-
-    limit = 7 * 1024 * 1024
-    conn.stubs(:max_bson_size).returns(limit)
-    conn.connect
-    assert_equal limit, conn.max_bson_size
-    assert_equal limit, BSON::BSON_CODER.max_bson_size
-    doc = {'n' => 'a' * ((limit) - 11)}
-    assert_raise_error InvalidDocument, "limited to #{limit}" do
-      assert BSON::BSON_CODER.serialize(doc)
+      assert BSON::BSON_CODER.serialize(doc, false, true, @conn.max_bson_size)
     end
   end
 
-  def test_max_bson_size_with_old_mongod
+  def test_max_bson_size_with_no_reported_max_size
     conn = standard_connection(:connect => false)
 
     admin_db = Object.new
-    admin_db.expects(:command).returns({'ok' => 1, 'ismaster' => 1}).twice
-    conn.expects(:[]).with('admin').returns(admin_db).twice
+    admin_db.expects(:command).returns({'ok' => 1, 'ismaster' => 1})
+    conn.expects(:[]).with('admin').returns(admin_db)
 
     conn.connect
     assert_equal Mongo::DEFAULT_MAX_BSON_SIZE, BSON::BSON_CODER.max_bson_size
@@ -253,6 +249,10 @@ class TestConnection < Test::Unit::TestCase
       @conn.add_auth(@auth['db_name'], @auth['username'], @auth['password'])
     end
 
+    teardown do
+      @conn.clear_auths
+    end
+
     should "save the authentication" do
       assert_equal @auth, @conn.auths[0]
     end
@@ -275,6 +275,42 @@ class TestConnection < Test::Unit::TestCase
     should "remove all auths" do
       @conn.clear_auths
       assert_equal 0, @conn.auths.length
+    end
+  end
+
+  context "Socket pools" do
+    context "checking out writers" do
+      setup do
+        @con = standard_connection(:pool_size => 10, :timeout => 10)
+        @coll = @con[MONGO_TEST_DB]['test-connection-exceptions']
+      end
+
+      should "close the connection on send_message for major exceptions" do
+        @con.expects(:checkout_writer).raises(SystemStackError)
+        @con.expects(:close)
+        begin
+          @coll.insert({:foo => "bar"})
+        rescue SystemStackError
+        end
+      end
+
+      should "close the connection on send_message_with_safe_check for major exceptions" do
+        @con.expects(:checkout_writer).raises(SystemStackError)
+        @con.expects(:close)
+        begin
+          @coll.insert({:foo => "bar"}, :safe => true)
+        rescue SystemStackError
+        end
+      end
+
+      should "close the connection on receive_message for major exceptions" do
+        @con.expects(:checkout_writer).raises(SystemStackError)
+        @con.expects(:close)
+        begin
+          @coll.find.next
+        rescue SystemStackError
+        end
+      end
     end
   end
 
@@ -315,10 +351,10 @@ class TestConnection < Test::Unit::TestCase
       fake_socket = Mocha::Mock.new
       fake_socket.stubs(:close).raises(IOError.new)
       fake_socket.stub_everything
-      TCPSocket.expects(:new).returns(fake_socket)
+      TCPSocket.stubs(:new).returns(fake_socket)
 
       @con.primary_pool.checkout_new_socket
-      assert_equal [], @con.primary_pool.close
+      assert @con.primary_pool.close
     end
   end
 end

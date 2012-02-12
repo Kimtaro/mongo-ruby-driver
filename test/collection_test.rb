@@ -1,13 +1,23 @@
 require './test/test_helper'
 
 class TestCollection < Test::Unit::TestCase
-  @@connection ||= standard_connection(:op_timeout => 2)
+  @@connection ||= standard_connection(:op_timeout => 10)
   @@db   = @@connection.db(MONGO_TEST_DB)
   @@test = @@db.collection("test")
   @@version = @@connection.server_version
 
   def setup
     @@test.remove
+  end
+
+  def test_capped_method
+    @@db.create_collection('normal')
+    assert !@@db['normal'].capped?
+    @@db.drop_collection('normal')
+
+    @@db.create_collection('c', :capped => true, :size => 100_000)
+    assert @@db['c'].capped?
+    @@db.drop_collection('c')
   end
 
   def test_optional_pk_factory
@@ -141,6 +151,90 @@ class TestCollection < Test::Unit::TestCase
     end
   end
 
+  def test_bulk_insert
+    docs = []
+    docs << {:foo => 1}
+    docs << {:foo => 2}
+    docs << {:foo => 3}
+    response = @@test.insert(docs)
+    assert_equal 3, response.length
+    assert response.all? {|id| id.is_a?(BSON::ObjectId)}
+    assert_equal 3, @@test.count
+  end
+
+  def test_bulk_insert_with_continue_on_error
+    if @@version >= "2.0"
+      @@test.create_index([["foo", 1]], :unique => true)
+      docs = []
+      docs << {:foo => 1}
+      docs << {:foo => 1}
+      docs << {:foo => 2}
+      docs << {:foo => 3}
+      assert_raise OperationFailure do
+        @@test.insert(docs, :safe => true)
+      end
+      assert_equal 1, @@test.count
+      @@test.remove
+
+      docs = []
+      docs << {:foo => 1}
+      docs << {:foo => 1}
+      docs << {:foo => 2}
+      docs << {:foo => 3}
+      assert_raise OperationFailure do
+        @@test.insert(docs, :safe => true, :continue_on_error => true)
+      end
+      assert_equal 3, @@test.count
+
+      @@test.remove
+      @@test.drop_index("foo_1")
+    end
+  end
+
+  def test_bson_valid_with_collect_on_error
+    docs = []
+    docs << {:foo => 1}
+    docs << {:bar => 1}
+    doc_ids, error_docs = @@test.insert(docs, :collect_on_error => true)
+    assert_equal 2, @@test.count
+    assert_equal error_docs, []
+  end
+
+  def test_bson_invalid_key_serialize_error_with_collect_on_error
+    docs = []
+    docs << {:foo => 1}
+    docs << {:bar => 1}
+    invalid_docs = []
+    invalid_docs << {'$invalid-key' => 1}
+    invalid_docs << {'invalid.key'  => 1}
+    docs += invalid_docs
+    assert_raise BSON::InvalidKeyName do
+      @@test.insert(docs, :collect_on_error => false)
+    end
+    assert_equal 0, @@test.count
+
+    doc_ids, error_docs = @@test.insert(docs, :collect_on_error => true)
+    assert_equal 2, @@test.count
+    assert_equal error_docs, invalid_docs
+  end
+
+  def test_bson_invalid_encoding_serialize_error_with_collect_on_error
+    docs = []
+    docs << {:foo => 1}
+    docs << {:bar => 1}
+    invalid_docs = []
+    invalid_docs << {"\223\372\226{" => 1} # non utf8 encoding
+    docs += invalid_docs
+    assert_raise BSON::InvalidStringEncoding do
+      @@test.insert(docs, :collect_on_error => false)
+    end
+    assert_equal 0, @@test.count
+
+    doc_ids, error_docs = @@test.insert(docs, :collect_on_error => true)
+    assert_equal 2, @@test.count
+    assert_equal error_docs, invalid_docs
+  end
+
   def test_maximum_insert_size
     docs = []
     16.times do
@@ -164,6 +258,14 @@ class TestCollection < Test::Unit::TestCase
       assert_raise_error ArgumentError, "Unknown key(s): wtime" do
         @@test.remove({:foo => 2}, :safe => {:w => 2, :wtime => 1, :fsync => true})
       end
+    end
+  end
+
+  if @@version >= "2.0.0"
+    def test_safe_mode_with_journal_commit_option
+      @@test.insert({:foo => 1}, :safe => {:j => true})
+      @@test.update({:foo => 1}, {:foo => 2}, :safe => {:j => true})
+      @@test.remove({:foo => 2}, :safe => {:j => true})
     end
   end
 
@@ -262,6 +364,7 @@ class TestCollection < Test::Unit::TestCase
     @conn = standard_connection
     @db   = @conn[MONGO_TEST_DB]
     @test = @db['test-safe-remove']
+    @test.remove
     @test.save({:a => 50})
     assert_equal 1, @test.remove({}, :safe => true)["n"]
     @test.drop
@@ -275,9 +378,13 @@ class TestCollection < Test::Unit::TestCase
     @@test.drop
 
     assert_equal 0, @@test.count
-    @@test.save("x" => 1)
-    @@test.save("x" => 2)
+    @@test.save(:x => 1)
+    @@test.save(:x => 2)
     assert_equal 2, @@test.count
+
+    assert_equal 1, @@test.count(:query => {:x => 1})
+    assert_equal 1, @@test.count(:limit => 1)
+    assert_equal 0, @@test.count(:skip => 2)
   end
 
   # Note: #size is just an alias for #count.
@@ -494,6 +601,22 @@ class TestCollection < Test::Unit::TestCase
         @@test.map_reduce(m, r, :raw => true, :out => {:inline => 1})
         assert res["results"]
       end
+      
+      def test_map_reduce_with_collection_output_to_other_db
+        @@test << {:user_id => 1}
+        @@test << {:user_id => 2}
+        
+        m = Code.new("function() { emit(this.user_id, 1); }")
+        r = Code.new("function(k,vals) { return 1; }")
+        oh = BSON::OrderedHash.new
+        oh[:replace] = 'foo'
+        oh[:db] = 'somedb'
+        res = @@test.map_reduce(m, r, :out => (oh))
+        assert res["result"]
+        assert res["counts"]
+        assert res["timeMillis"]
+        assert res.find.to_a.any? {|doc| doc["_id"] == 2 && doc["value"] == 1}
+      end
     end
   end
 
@@ -617,13 +740,13 @@ class TestCollection < Test::Unit::TestCase
 
     @@test.ensure_index([["x", Mongo::DESCENDING]], {})
     assert_equal 2, @@test.index_information.keys.count
-    assert @@test.index_information.keys.include? "x_-1"
+    assert @@test.index_information.keys.include?("x_-1")
 
     @@test.ensure_index([["x", Mongo::ASCENDING]])
-    assert @@test.index_information.keys.include? "x_1"
+    assert @@test.index_information.keys.include?("x_1")
 
     @@test.ensure_index([["type", 1], ["date", -1]])
-    assert @@test.index_information.keys.include? "type_1_date_-1"
+    assert @@test.index_information.keys.include?("type_1_date_-1")
 
     @@test.drop_index("x_1")
     assert_equal 3, @@test.index_information.keys.count
@@ -632,7 +755,7 @@ class TestCollection < Test::Unit::TestCase
 
     @@test.ensure_index([["x", Mongo::DESCENDING]], {})
     assert_equal 3, @@test.index_information.keys.count
-    assert @@test.index_information.keys.include? "x_-1"
+    assert @@test.index_information.keys.include?("x_-1")
 
     # Make sure that drop_index expires cache properly
     @@test.ensure_index([['a', 1]])
@@ -659,6 +782,26 @@ class TestCollection < Test::Unit::TestCase
     sleep(3)
     # This won't be, so generate_indexes will be called twice
     coll.ensure_index([['a', 1]])
+  end
+
+
+  if @@version > '2.0.0'
+    def test_show_disk_loc
+      @@test.save({:a => 1})
+      @@test.save({:a => 2})
+      assert @@test.find({:a => 1}, :show_disk_loc => true).show_disk_loc
+      assert @@test.find({:a => 1}, :show_disk_loc => true).next['$diskLoc']
+      @@test.remove
+    end
+
+    def test_max_scan
+      1000.times do |n|
+        @@test.save({:a => n})
+      end
+      assert @@test.find({:a => 999}).next
+      assert !@@test.find({:a => 999}, :max_scan => 500).next
+      @@test.remove
+    end
   end
 
   context "Grouping" do
@@ -739,6 +882,7 @@ class TestCollection < Test::Unit::TestCase
   context "A collection with two records" do
     setup do
       @collection = @@db.collection('test-collection')
+      @collection.remove
       @collection.insert({:name => "Jones"})
       @collection.insert({:name => "Smith"})
     end

@@ -2,16 +2,21 @@ $:.unshift(File.join(File.dirname(__FILE__), '..', 'lib'))
 require './test/test_helper'
 require './test/tools/repl_set_manager'
 
-unless defined? RS
-  RS = ReplSetManager.new
-  RS.start_set
-end
-
 class Test::Unit::TestCase
+  # Ensure replica set is available as an instance variable and that
+  # a new set is spun up for each TestCase class
+  def ensure_rs
+    unless defined?(@@current_class) and @@current_class == self.class
+      @@current_class = self.class 
+      @@rs = ReplSetManager.new
+      @@rs.start_set
+    end
+    @rs = @@rs
+  end
 
   # Generic code for rescuing connection failures and retrying operations.
   # This could be combined with some timeout functionality.
-  def rescue_connection_failure(max_retries=60)
+  def rescue_connection_failure(max_retries=30)
     retries = 0
     begin
       yield
@@ -19,9 +24,8 @@ class Test::Unit::TestCase
       puts "Rescue attempt #{retries}: from #{ex}"
       retries += 1
       raise ex if retries > max_retries
-      sleep(1)
+      sleep(2)
       retry
     end
   end
-
 end

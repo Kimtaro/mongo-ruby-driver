@@ -16,12 +16,10 @@
 # limitations under the License.
 # ++
 
-$:.unshift(File.join(File.dirname(__FILE__), '..', 'lib'))
-
-MINIMUM_BSON_EXT_VERSION = "1.3.1"
+MINIMUM_BSON_EXT_VERSION = "1.5.2"
 
 module BSON
-  VERSION = "1.3.1"
+  VERSION = "1.5.2"
 
   if defined? Mongo::DEFAULT_MAX_BSON_SIZE
     DEFAULT_MAX_BSON_SIZE = Mongo::DEFAULT_MAX_BSON_SIZE
@@ -56,7 +54,7 @@ end
 
 if RUBY_PLATFORM =~ /java/
   jar_dir = File.join(File.dirname(__FILE__), '..', 'ext', 'java', 'jar')
-  require File.join(jar_dir, 'mongo-2.4.jar')
+  require File.join(jar_dir, 'mongo-2.6.5.jar')
   require File.join(jar_dir, 'jbson.jar')
   require 'bson/bson_java'
   module BSON

@@ -1,12 +1,18 @@
 # -*- mode: ruby; -*-
-require 'rubygems'
-require 'rubygems/specification'
+if RUBY_VERSION < '1.9.0'
+  require 'rubygems'
+  require 'rubygems/specification'
+end
 require 'fileutils'
-require 'rake'
 require 'rake/testtask'
-require 'rake/gempackagetask'
 require 'rbconfig'
+require 'rake'
+begin
+  require 'ci/reporter/rake/test_unit'
+  rescue LoadError
+end
 include Config
+
 ENV['TEST_MODE'] = 'TRUE'
 
 task :java do
@@ -22,12 +28,11 @@ namespace :build do
     jar_dir   = File.join(java_dir, 'jar')
 
     jruby_jar = File.join(jar_dir, 'jruby.jar')
-    mongo_jar = File.join(jar_dir, 'mongo-2.4.jar')
-    bson_jar = File.join(jar_dir, 'bson-2.2.jar')
+    mongo_jar = File.join(jar_dir, 'mongo-2.6.5.jar')
 
     src_base   = File.join(java_dir, 'src')
 
-    system("javac -Xlint:unchecked -classpath #{jruby_jar}:#{mongo_jar}:#{bson_jar} #{File.join(src_base, 'org', 'jbson', '*.java')}")
+    system("javac -Xlint:deprecation -Xlint:unchecked -classpath #{jruby_jar}:#{mongo_jar} #{File.join(src_base, 'org', 'jbson', '*.java')}")
     system("cd #{src_base} && jar cf #{File.join(jar_dir, 'jbson.jar')} #{File.join('.', 'org', 'jbson', '*.class')}")
   end
 end
@@ -38,10 +43,14 @@ task :test do
   puts "To test the pure ruby driver: \nrake test:ruby\n\n"
 end
 
+task :path do
+    $:.unshift(File.join(File.dirname(__FILE__), 'lib'))
+end
+
 namespace :test do
 
   desc "Test the driver with the C extension enabled."
-  task :c do
+  task :c => :path do
     ENV['C_EXT'] = 'TRUE'
     if ENV['TEST']
       Rake::Task['test:functional'].invoke
@@ -56,7 +65,7 @@ namespace :test do
   end
 
   desc "Test the driver using pure ruby (no C extension)"
-  task :ruby do
+  task :ruby => :path do
     ENV['C_EXT'] = nil
     if ENV['TEST']
       Rake::Task['test:functional'].invoke
@@ -118,9 +127,9 @@ namespace :test do
     t.ruby_opts << '-w'
   end
 
-  task :drop_databases do |t|
+  task :drop_databases => :path do |t|
     puts "Dropping test databases..."
-    require './lib/mongo'
+    require 'mongo'
     con = Mongo::Connection.new(ENV['MONGO_RUBY_DRIVER_HOST'] || 'localhost',
       ENV['MONGO_RUBY_DRIVER_PORT'] || Mongo::Connection::DEFAULT_PORT)
     con.database_names.each do |name|
@@ -139,13 +148,13 @@ end
 
 desc "Generate YARD documentation"
 task :ydoc do
-  require File.join(File.dirname(__FILE__), 'lib', 'mongo')
+  require 'mongo'
   out = File.join('ydoc', Mongo::VERSION)
   FileUtils.rm_rf('ydoc')
-  system "yardoc lib/**/*.rb lib/mongo/**/*.rb lib/bson/**/*.rb -e yard/yard_ext.rb -p yard/templates -o #{out} --title MongoRuby-#{Mongo::VERSION} --files docs/TUTORIAL.md,docs/GridFS.md,docs/FAQ.md,docs/REPLICA_SETS.md,docs/WRITE_CONCERN.md,docs/HISTORY.md,docs/CREDITS.md,docs/RELEASES.md"
+  system "yardoc lib/**/*.rb lib/mongo/**/*.rb lib/bson/**/*.rb -e ./yard/yard_ext.rb -p yard/templates -o #{out} --title MongoRuby-#{Mongo::VERSION} --files docs/TUTORIAL.md,docs/GridFS.md,docs/FAQ.md,docs/REPLICA_SETS.md,docs/WRITE_CONCERN.md,docs/READ_PREFERENCE.md,docs/HISTORY.md,docs/CREDITS.md,docs/RELEASES.md,docs/CREDITS.md,docs/TAILABLE_CURSORS.md"
 end
 
-namespace :bamboo do
+namespace :jenkins do
   task :ci_reporter do
     begin
       require 'ci/reporter/rake/test_unit'
@@ -155,11 +164,11 @@ namespace :bamboo do
   end
 
   namespace :test do
-    task :ruby => [:ci_reporter, "ci:setup:testunit"] do
+    task :ruby do
       Rake::Task['test:ruby'].invoke
     end
 
-    task :c => [:ci_reporter, "ci:setup:testunit"] do
+    task :c do
       Rake::Task['gem:install_extensions'].invoke
       Rake::Task['test:c'].invoke
     end
@@ -179,10 +188,14 @@ namespace :gem do
     `rm mongo-*.gem`
     `rm bson-*.gem`
   end
+  
+  desc "Uninstall the optional c extensions"
+  task :uninstall_extensions do
+    `gem uninstall bson_ext`
+  end
 
   desc "Install the optional c extensions"
   task :install_extensions do
-    `gem uninstall bson_ext`
     `gem build bson_ext.gemspec`
     `gem install --no-rdoc --no-ri bson_ext-*.gem`
     `rm bson_ext-*.gem`
@@ -200,7 +213,7 @@ end
 
 namespace :ci do
   namespace :test do
-    task :c do
+    task :c => :path do
       Rake::Task['gem:install'].invoke
       Rake::Task['gem:install_extensions'].invoke
       Rake::Task['test:c'].invoke

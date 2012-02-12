@@ -1,112 +1,120 @@
 $:.unshift(File.join(File.dirname(__FILE__), '..', 'lib'))
 require './test/replica_sets/rs_test_helper'
 
-# NOTE: This test expects a replica set of three nodes to be running on RS.host,
-# on ports TEST_PORT, RS.ports[1], and TEST + 2.
 class ConnectTest < Test::Unit::TestCase
-  include Mongo
-
   def setup
-    RS.restart_killed_nodes
+    ensure_rs
   end
 
   def teardown
-    RS.restart_killed_nodes
+    @rs.restart_killed_nodes
+    @conn.close if defined?(@conn) && @conn
   end
 
+  # TODO: test connect timeout.
+
   def test_connect_with_deprecated_multi
-    @conn = Connection.multi([[RS.host, RS.ports[0]], [RS.host, RS.ports[1]]], :name => RS.name)
+    @conn = Connection.multi([[@rs.host, @rs.ports[0]], [@rs.host, @rs.ports[1]]], :name => @rs.name)
     assert @conn.is_a?(ReplSetConnection)
     assert @conn.connected?
   end
 
   def test_connect_bad_name
     assert_raise_error(ReplicaSetConnectionError, "-wrong") do
-      ReplSetConnection.new([RS.host, RS.ports[0]], [RS.host, RS.ports[1]],
-        [RS.host, RS.ports[2]], :rs_name => RS.name + "-wrong")
+      @conn = ReplSetConnection.new([@rs.host, @rs.ports[0]], [@rs.host, @rs.ports[1]],
+        [@rs.host, @rs.ports[2]], :name => @rs.name + "-wrong")
     end
-  end
-
-  def test_connect_timeout
-    passed = false
-    timeout = 3
-    begin
-      t0 = Time.now
-      ReplSetConnection.new(['192.169.169.1', 27017], :connect_timeout => timeout)
-    rescue OperationTimeout
-      passed = true
-      t1 = Time.now
-    end
-
-    assert passed
-    assert t1 - t0 < timeout + 1
-  end
-
-  def test_connect
-    @conn = ReplSetConnection.new([RS.host, RS.ports[1]], [RS.host, RS.ports[0]],
-      [RS.host, RS.ports[2]], :name => RS.name)
-    assert @conn.connected?
-    assert @conn.read_primary?
-    assert @conn.primary?
-
-    assert_equal RS.primary, @conn.primary
-    assert_equal RS.secondaries.sort, @conn.secondaries.sort
-    assert_equal RS.arbiters.sort, @conn.arbiters.sort
-
-    @conn = ReplSetConnection.new([RS.host, RS.ports[1]], [RS.host, RS.ports[0]],
-      :name => RS.name)
-    assert @conn.connected?
-  end
-
-  def test_host_port_accessors
-    @conn = ReplSetConnection.new([RS.host, RS.ports[0]], [RS.host, RS.ports[1]],
-      [RS.host, RS.ports[2]], :name => RS.name)
-
-    assert_equal @conn.host, RS.primary[0]
-    assert_equal @conn.port, RS.primary[1]
   end
 
   def test_connect_with_primary_node_killed
-    node = RS.kill_primary
+    node = @rs.kill_primary
 
     # Becuase we're killing the primary and trying to connect right away,
     # this is going to fail right away.
     assert_raise_error(ConnectionFailure, "Failed to connect to primary node") do
-      @conn = ReplSetConnection.new([RS.host, RS.ports[0]], [RS.host, RS.ports[1]],
-        [RS.host, RS.ports[2]])
+      @conn = ReplSetConnection.new([@rs.host, @rs.ports[0]], [@rs.host, @rs.ports[1]],
+        [@rs.host, @rs.ports[2]])
     end
 
     # This allows the secondary to come up as a primary
     rescue_connection_failure do
-      @conn = ReplSetConnection.new([RS.host, RS.ports[0]], [RS.host, RS.ports[1]],
-        [RS.host, RS.ports[2]])
+      @conn = ReplSetConnection.new([@rs.host, @rs.ports[0]], [@rs.host, @rs.ports[1]],
+        [@rs.host, @rs.ports[2]])
     end
   end
 
   def test_connect_with_secondary_node_killed
-    node = RS.kill_secondary
-
-    @conn = ReplSetConnection.new([RS.host, RS.ports[0]], [RS.host, RS.ports[1]],
-      [RS.host, RS.ports[2]])
-    assert @conn.connected?
-  end
-
-  def test_connect_with_third_node_killed
-    RS.kill(RS.get_node_from_port(RS.ports[2]))
-
-    @conn = ReplSetConnection.new([RS.host, RS.ports[0]], [RS.host, RS.ports[1]],
-      [RS.host, RS.ports[2]])
-    assert @conn.connected?
-  end
-
-  def test_connect_with_primary_stepped_down
-    RS.step_down_primary
+    node = @rs.kill_secondary
 
     rescue_connection_failure do
-      @conn = ReplSetConnection.new([RS.host, RS.ports[0]], [RS.host, RS.ports[1]],
-        [RS.host, RS.ports[2]])
+      @conn = ReplSetConnection.new([@rs.host, @rs.ports[0]], [@rs.host, @rs.ports[1]],
+        [@rs.host, @rs.ports[2]])
     end
     assert @conn.connected?
   end
 
+  def test_connect_with_third_node_killed
+    @rs.kill(@rs.get_node_from_port(@rs.ports[2]))
+
+    rescue_connection_failure do
+      @conn = ReplSetConnection.new([@rs.host, @rs.ports[0]], [@rs.host, @rs.ports[1]],
+        [@rs.host, @rs.ports[2]])
+    end
+    assert @conn.connected?
+  end
+
+  def test_connect_with_primary_stepped_down
+    @conn = ReplSetConnection.new([@rs.host, @rs.ports[0]], [@rs.host, @rs.ports[1]],
+      [@rs.host, @rs.ports[2]])
+    @conn[MONGO_TEST_DB]['bar'].save({:a => 1}, {:safe => {:w => 3}})
+    assert @conn[MONGO_TEST_DB]['bar'].find_one
+
+    primary = Mongo::Connection.new(@conn.primary_pool.host, @conn.primary_pool.port)
+    assert_raise Mongo::ConnectionFailure do
+      primary['admin'].command({:replSetStepDown => 60})
+    end
+    assert @conn.connected?
+    assert_raise Mongo::ConnectionFailure do
+      @conn[MONGO_TEST_DB]['bar'].find_one
+    end
+    assert !@conn.connected?
+
+    rescue_connection_failure do
+      @conn[MONGO_TEST_DB]['bar'].find_one
+    end
+  end
+
+  def test_save_with_primary_stepped_down
+    @conn = ReplSetConnection.new([@rs.host, @rs.ports[0]], [@rs.host, @rs.ports[1]],
+      [@rs.host, @rs.ports[2]])
+
+    primary = Mongo::Connection.new(@conn.primary_pool.host, @conn.primary_pool.port)
+
+    # Adding force=true to avoid 'no secondaries within 10 seconds of my optime' errors
+    step_down_command = BSON::OrderedHash.new
+    step_down_command[:replSetStepDown] = 60
+    step_down_command[:force]           = true
+    assert_raise Mongo::ConnectionFailure do
+      primary['admin'].command(step_down_command)
+    end
+
+    rescue_connection_failure do
+      @conn[MONGO_TEST_DB]['bar'].save({:a => 1}, {:safe => {:w => 3}})
+    end
+  end
+
+  def test_connect_with_connection_string
+    @conn = Connection.from_uri("mongodb://#{@rs.host}:#{@rs.ports[0]},#{@rs.host}:#{@rs.ports[1]}?replicaset=#{@rs.name}")
+    assert @conn.is_a?(ReplSetConnection)
+    assert @conn.connected?
+  end
+
+  def test_connect_with_full_connection_string
+    @conn = Connection.from_uri("mongodb://#{@rs.host}:#{@rs.ports[0]},#{@rs.host}:#{@rs.ports[1]}?replicaset=#{@rs.name};safe=true;w=2;fsync=true;slaveok=true")
+    assert @conn.is_a?(ReplSetConnection)
+    assert @conn.connected?
+    assert_equal 2, @conn.safe[:w]
+    assert @conn.safe[:fsync]
+    assert @conn.read_pool
+  end
 end

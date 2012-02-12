@@ -2,8 +2,8 @@ require './test/test_helper'
 require 'logger'
 
 class CursorTest < Test::Unit::TestCase
-
   include Mongo
+  include Mongo::Constants
 
   @@connection = standard_connection
   @@db   = @@connection.db(MONGO_TEST_DB)
@@ -16,11 +16,72 @@ class CursorTest < Test::Unit::TestCase
     @@coll_full_name = "#{MONGO_TEST_DB}.test"
   end
 
+  def test_alive
+    batch = []
+    5000.times do |n|
+      batch << {:a => n}
+    end
+
+    @@coll.insert(batch)
+    cursor = @@coll.find
+    assert !cursor.alive?
+    cursor.next
+    assert cursor.alive?
+    cursor.close
+    assert !cursor.alive?
+    @@coll.remove
+  end
+
+  def test_add_and_remove_options
+    c = @@coll.find
+    assert_equal 0, c.options & OP_QUERY_EXHAUST
+    c.add_option(OP_QUERY_EXHAUST)
+    assert_equal OP_QUERY_EXHAUST, c.options & OP_QUERY_EXHAUST
+    c.remove_option(OP_QUERY_EXHAUST)
+    assert_equal 0, c.options & OP_QUERY_EXHAUST
+
+    c.next
+    assert_raise Mongo::InvalidOperation do
+      c.add_option(OP_QUERY_EXHAUST)
+    end
+
+    assert_raise Mongo::InvalidOperation do
+      c.add_option(OP_QUERY_EXHAUST)
+    end
+  end
+
+  def test_exhaust
+    if @@version >= "2.0"
+      @@coll.remove
+      data = "1" * 10_000
+      5000.times do |n|
+        @@coll.insert({:n => n, :data => data})
+      end
+
+      c = Cursor.new(@@coll)
+      c.add_option(OP_QUERY_EXHAUST)
+      assert_equal @@coll.count, c.to_a.size
+      assert c.closed?
+
+      c = Cursor.new(@@coll)
+      c.add_option(OP_QUERY_EXHAUST)
+      4999.times do
+        c.next
+      end
+      assert c.has_next?
+      assert c.next
+      assert !c.has_next?
+      assert c.closed?
+
+      @@coll.remove
+    end
+  end
+
   def test_inspect
     selector = {:a => 1}
     cursor = @@coll.find(selector)
     assert_equal "<Mongo::Cursor:0x#{cursor.object_id.to_s(16)} namespace='#{@@db.name}.#{@@coll.name}' " +
-        "@selector=#{selector.inspect}>", cursor.inspect
+        "@selector=#{selector.inspect} @cursor_id=#{cursor.cursor_id}>", cursor.inspect
   end
 
   def test_explain

@@ -38,8 +38,10 @@ module Mongo
       @chunks  = @db["#{fs_name}.chunks"]
       @fs_name = fs_name
 
-      # Ensure indexes only if not connected to slave.
-      unless db.connection.slave_ok?
+      # Create indexes only if we're connected to a primary node.
+      connection = @db.connection
+      if (connection.class == Connection && connection.read_primary?) ||
+          (connection.class == ReplSetConnection && connection.primary)
         @chunks.create_index([['files_id', Mongo::ASCENDING], ['n', Mongo::ASCENDING]], :unique => true)
       end
     end
@@ -63,12 +65,12 @@ module Mongo
     # @option opts [Boolean] :safe (false) When safe mode is enabled, the chunks sent to the server
     #   will be validated using an md5 hash. If validation fails, an exception will be raised.
     #
-    # @return [Mongo::ObjectId] the file's id.
+    # @return [BSON::ObjectId] the file's id.
     def put(data, opts={})
       opts     = opts.dup
       filename = opts[:filename]
       opts.merge!(default_grid_io_opts)
-      file = GridIO.new(@files, @chunks, filename, 'w', opts=opts)
+      file = GridIO.new(@files, @chunks, filename, 'w', opts)
       file.write(data)
       file.close
       file.files_id

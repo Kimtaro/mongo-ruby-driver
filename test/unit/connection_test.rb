@@ -9,8 +9,8 @@ class ConnectionTest < Test::Unit::TestCase
         TCPSocket.stubs(:new).returns(new_mock_socket)
 
         admin_db = new_mock_db
-        admin_db.expects(:command).returns({'ok' => 1, 'ismaster' => 1}).twice
-        @conn.expects(:[]).with('admin').returns(admin_db).twice
+        admin_db.expects(:command).returns({'ok' => 1, 'ismaster' => 1})
+        @conn.expects(:[]).with('admin').returns(admin_db)
         @conn.connect
       end
 
@@ -40,6 +40,34 @@ class ConnectionTest < Test::Unit::TestCase
         assert_equal [host_name, 27017], @conn.host_to_try
       end
 
+      should "allow db without username and password" do
+        host_name = "foo.bar-12345.org"
+        @conn = Connection.from_uri("mongodb://#{host_name}/foo", :connect => false)
+        assert_equal [host_name, 27017], @conn.host_to_try
+      end
+      
+      should "set safe options on connection" do
+        host_name = "localhost"
+        opts = "safe=true&w=2&wtimeoutMS=1000&fsync=true&journal=true"
+        @conn = Connection.from_uri("mongodb://#{host_name}/foo?#{opts}", :connect => false)
+        assert_equal({:w => 2, :wtimeout => 1000, :fsync => true, :j => true}, @conn.safe)
+      end
+      
+      should "have wtimeoutMS take precidence over the depricated wtimeout" do
+        host_name = "localhost"
+        opts = "safe=true&wtimeout=100&wtimeoutMS=500"
+        @conn = Connection.from_uri("mongodb://#{host_name}/foo?#{opts}", :connect => false)
+        assert_equal({:wtimeout => 500}, @conn.safe)
+      end
+      
+      should "set timeout options on connection" do
+        host_name = "localhost"
+        opts = "connectTimeoutMS=1000&socketTimeoutMS=5000"
+        @conn = Connection.from_uri("mongodb://#{host_name}/foo?#{opts}", :connect => false)
+        assert_equal 1, @conn.connect_timeout
+        assert_equal 5, @conn.op_timeout
+      end
+
       should "parse a uri with a hyphen & underscore in the username or password" do
         @conn = Connection.from_uri("mongodb://hyphen-user_name:p-s_s@localhost:27017/db", :connect => false)
         assert_equal ['localhost', 27017], @conn.host_to_try
@@ -52,8 +80,8 @@ class ConnectionTest < Test::Unit::TestCase
         @conn = Connection.from_uri("mongodb://localhost", :connect => false)
 
         admin_db = new_mock_db
-        admin_db.expects(:command).returns({'ok' => 1, 'ismaster' => 1}).twice
-        @conn.expects(:[]).with('admin').returns(admin_db).twice
+        admin_db.expects(:command).returns({'ok' => 1, 'ismaster' => 1})
+        @conn.expects(:[]).with('admin').returns(admin_db)
         @conn.connect
       end
 
@@ -65,16 +93,10 @@ class ConnectionTest < Test::Unit::TestCase
         assert_raise MongoArgumentError do
           Connection.from_uri("mongodb://localhost:abc", :connect => false)
         end
-
-        assert_raise MongoArgumentError do
-          Connection.from_uri("mongodb://localhost:27017, my.db.com:27018, ", :connect => false)
-        end
       end
 
-      should "require all of username, password, and database if any one is specified" do
-        assert_raise MongoArgumentError do
-          Connection.from_uri("mongodb://localhost/db", :connect => false)
-        end
+      should "require all of username, if password and db are specified" do
+        assert Connection.from_uri("mongodb://kyle:jones@localhost/db", :connect => false)
 
         assert_raise MongoArgumentError do
           Connection.from_uri("mongodb://kyle:password@localhost", :connect => false)
